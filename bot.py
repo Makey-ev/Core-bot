@@ -9,24 +9,26 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message)
+                           InlineKeyboardMarkup, Message, ReplyKeyboardMarkup,
+                           KeyboardButton)
 from texts import TEXTS
 
 TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_СЮДА_ТОКЕН")
 
-MAX_PROFILES = 3     # профилей на опекуна (пилот)
-FREE_MEDS = 3        # лекарств на профиль (пилот; потом 1 + Premium)
-DIGEST_HOUR = 21     # час вечернего дайджеста (время опекуна)
+MAX_PROFILES = 3
+FREE_MEDS = 3
+DIGEST_HOUR = 21
 SNOOZE_MIN = 15
-ESC_REPEAT_MIN = 30  # через сколько повторить пациенту
-ESC_ALERT_MIN = 30   # ещё через сколько — сигнал опекуну
-MISSED_AFTER_H = 12  # когда считать приём пропущенным
+ESC_REPEAT_MIN = 30
+ESC_ALERT_MIN = 30
+MISSED_AFTER_H = 12
 
 db = sqlite3.connect("care.db", check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(
-    uid INTEGER PRIMARY KEY, lang TEXT, tz INTEGER DEFAULT 3);
+    uid INTEGER PRIMARY KEY, lang TEXT, tz INTEGER DEFAULT 3,
+    step TEXT DEFAULT 'menu');
 CREATE TABLE IF NOT EXISTS patients(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner INTEGER, name TEXT, user_uid INTEGER,
@@ -72,6 +74,16 @@ def gen_code():
         if db.execute("SELECT 1 FROM patients WHERE code=?", (code,)).fetchone() is None:
             return code
 
+def main_menu(uid):
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text=t(uid, "menu_add_med")),
+         KeyboardButton(text=t(uid, "menu_list"))],
+        [KeyboardButton(text=t(uid, "menu_stats")),
+         KeyboardButton(text=t(uid, "menu_family"))],
+        [KeyboardButton(text=t(uid, "menu_lang"))],
+    ], resize_keyboard=True)
+    return kb
+
 def dose_kb(uid, did):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=t(uid, "btn_took"), callback_data=f"take:{did}"),
@@ -93,148 +105,31 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     ensure_user(m.from_user.id, m.from_user.language_code)
-    await m.answer(t(m.from_user.id, "welcome"))
+    await m.answer(t(m.from_user.id, "welcome"), reply_markup=main_menu(m.from_user.id))
 
-@dp.message(Command("help"))
-async def cmd_help(m: Message):
+@dp.message(F.text == "🏠 Меню")
+async def menu_back(m: Message):
     ensure_user(m.from_user.id, m.from_user.language_code)
-    await m.answer(t(m.from_user.id, "welcome"))
+    await m.answer(t(m.from_user.id, "menu_text"), reply_markup=main_menu(m.from_user.id))
 
-@dp.message(Command("language"))
-async def cmd_lang(m: Message):
-    ensure_user(m.from_user.id, m.from_user.language_code)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=name, callback_data=f"lang:{code}")]
-        for code, name in LANG_NAMES.items()])
-    await m.answer(t(m.from_user.id, "lang_choose"), reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("lang:"))
-async def cb_lang(cb: CallbackQuery):
-    ensure_user(cb.from_user.id, cb.from_user.language_code)
-    code = cb.data.split(":")[1]
-    if code in TEXTS:
-        db.execute("UPDATE users SET lang=? WHERE uid=?", (code, cb.from_user.id))
-        db.commit()
-    await cb.answer("OK")
-    await cb.message.edit_text(t(cb.from_user.id, "lang_set"))
-
-@dp.message(Command("tz"))
-async def cmd_tz(m: Message):
+@dp.message(F.text.in_(["➕ Лекарство", "➕ Medication", "➕ Ліки", "➕ Farmaco", "➕ Medicamento", "➕ Medikament"]))
+async def add_med_start(m: Message):
     ensure_user(m.from_user.id, m.from_user.language_code)
     uid = m.from_user.id
-    parts = m.text.split(maxsplit=1)
-    try:
-        tz = int(parts[1].replace("+", ""))
-        assert -12 <= tz <= 14
-    except Exception:
-        await m.answer(t(uid, "tz_usage"))
-        return
-    db.execute("UPDATE users SET tz=? WHERE uid=?", (tz, uid))
+    db.execute("UPDATE users SET step='med_name' WHERE uid=?", (uid,))
     db.commit()
-    await m.answer(t(uid, "tz_set", tz=f"{tz:+d}"))
+    await m.answer(t(uid, "med_ask_name"), reply_markup=ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🏠 Меню")]], resize_keyboard=True))
 
-@dp.message(Command("care"))
-async def cmd_care(m: Message):
-    ensure_user(m.from_user.id, m.from_user.language_code)
-    uid = m.from_user.id
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2 or " " in parts[1].strip():
-        await m.answer(t(uid, "care_usage"))
-        return
-    name = parts[1].strip()[:30]
-    if db.execute("SELECT 1 FROM patients WHERE owner=? AND name=?", (uid, name)).fetchone():
-        await m.answer(t(uid, "care_usage"))
-        return
-    if db.execute("SELECT COUNT(*) c FROM patients WHERE owner=?", (uid,)).fetchone()["c"] >= MAX_PROFILES:
-        await m.answer(t(uid, "care_limit"))
-        return
-    code = gen_code()
-    db.execute("INSERT INTO patients(owner, name, code) VALUES(?,?,?)", (uid, name, code))
-    db.commit()
-    await m.answer(t(uid, "care_created", name=name, code=code))
-
-@dp.message(Command("self"))
-async def cmd_self(m: Message):
-    ensure_user(m.from_user.id, m.from_user.language_code)
-    uid = m.from_user.id
-    if db.execute("SELECT 1 FROM patients WHERE owner=? AND user_uid=?", (uid, uid)).fetchone():
-        await m.answer(t(uid, "self_exists"))
-        return
-    name = t(uid, "self_name")
-    db.execute("INSERT INTO patients(owner, name, user_uid, code) VALUES(?,?,?,?)",
-               (uid, name, uid, gen_code()))
-    db.commit()
-    await m.answer(t(uid, "self_created", name=name))
-
-@dp.message(Command("med"))
-async def cmd_med(m: Message):
-    ensure_user(m.from_user.id, m.from_user.language_code)
-    uid = m.from_user.id
-    parts = m.text.split(maxsplit=3)
-    if len(parts) < 4:
-        await m.answer(t(uid, "med_usage"))
-        return
-    p = db.execute("SELECT * FROM patients WHERE owner=? AND name=?",
-                   (uid, parts[1])).fetchone()
-    if p is None:
-        await m.answer(t(uid, "no_profile", name=parts[1]))
-        return
-    times = []
-    for part in parts[2].split(","):
-        part = part.strip()
-        if not re.fullmatch(r"\d{1,2}:\d{2}", part):
-            await m.answer(t(uid, "med_usage"))
-            return
-        h, mi = map(int, part.split(":"))
-        if h > 23 or mi > 59:
-            await m.answer(t(uid, "med_usage"))
-            return
-        times.append(f"{h:02d}:{mi:02d}")
-    times = sorted(set(times))[:6]
-    if db.execute("SELECT COUNT(*) c FROM meds WHERE patient_id=?",
-                  (p["id"],)).fetchone()["c"] >= FREE_MEDS:
-        await m.answer(t(uid, "med_limit"))
-        return
-    db.execute("INSERT INTO meds(patient_id, name, times, created) VALUES(?,?,?,?)",
-               (p["id"], parts[3].strip()[:50], ",".join(times), now_utc().isoformat()))
-    db.commit()
-    await m.answer(t(uid, "med_added", name=p["name"], med=parts[3].strip()[:50],
-                     times=", ".join(times)))
-
-@dp.message(Command("family"))
-async def cmd_family(m: Message):
-    ensure_user(m.from_user.id, m.from_user.language_code)
-    uid = m.from_user.id
-    parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer(t(uid, "family_bad"))
-        return
-    p = db.execute("SELECT * FROM patients WHERE code=?",
-                   (parts[1].strip().upper(),)).fetchone()
-    if p is None:
-        await m.answer(t(uid, "family_bad"))
-        return
-    if p["user_uid"] and p["user_uid"] != uid:
-        await m.answer(t(uid, "family_already"))
-        return
-    db.execute("UPDATE patients SET user_uid=? WHERE id=?", (uid, p["id"]))
-    db.commit()
-    await m.answer(t(uid, "family_ok", name=p["name"]))
-    if p["owner"] != uid:
-        try:
-            await m.bot.send_message(p["owner"], t(p["owner"], "family_notify", name=p["name"]))
-        except Exception:
-            pass
-
-@dp.message(Command("list"))
-async def cmd_list(m: Message):
+@dp.message(F.text.in_(["📋 Список", "📋 List", "📋 Список", "📋 Elenco", "📋 Lista", "📋 Liste"]))
+async def show_list(m: Message):
     ensure_user(m.from_user.id, m.from_user.language_code)
     uid = m.from_user.id
     ps = db.execute("SELECT * FROM patients WHERE owner=? OR user_uid=?", (uid, uid)).fetchall()
     if not ps:
-        await m.answer(t(uid, "list_empty"))
+        await m.answer(t(uid, "list_empty"), reply_markup=main_menu(uid))
         return
-    lines, buttons = [], []
+    lines = [t(uid, "list_head")]
     for p in ps:
         ptz = tz_of(p["user_uid"] or p["owner"])
         today = (now_utc() + timedelta(hours=ptz)).date().isoformat()
@@ -244,20 +139,15 @@ async def cmd_list(m: Message):
             c = db.execute("SELECT COUNT(*) c, SUM(status='taken') k FROM doses "
                            "WHERE med_id=? AND day=?", (med["id"], today)).fetchone()
             lines.append(f"  💊 {med['name']} — {med['times']} ({c['k'] or 0}/{c['c']})")
-            if p["owner"] == uid:
-                buttons.append([InlineKeyboardButton(
-                    text=f"🗑 {p['name']}: {med['name']}"[:40],
-                    callback_data=f"delmed:{med['id']}")])
-    await m.answer(t(uid, "list_head") + "\n" + "\n".join(lines),
-                   reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
+    await m.answer("\n".join(lines), reply_markup=main_menu(uid))
 
-@dp.message(Command("stats"))
-async def cmd_stats(m: Message):
+@dp.message(F.text.in_(["📊 Статистика", "📊 Stats", "📊 Статистика", "📊 Statistiche", "📊 Estadísticas", "📊 Statistik"]))
+async def show_stats(m: Message):
     ensure_user(m.from_user.id, m.from_user.language_code)
     uid = m.from_user.id
     ps = db.execute("SELECT * FROM patients WHERE owner=? OR user_uid=?", (uid, uid)).fetchall()
     if not ps:
-        await m.answer(t(uid, "list_empty"))
+        await m.answer(t(uid, "list_empty"), reply_markup=main_menu(uid))
         return
     lines = [t(uid, "stats_head")]
     for p in ps:
@@ -269,7 +159,92 @@ async def cmd_stats(m: Message):
         pct = round(100 * (r["k"] or 0) / r["c"]) if r["c"] else 100
         lines.append(t(uid, "stats_line", name=p["name"], pct=pct,
                        taken=r["k"] or 0, total=r["c"]))
-    await m.answer("\n".join(lines))
+    await m.answer("\n".join(lines), reply_markup=main_menu(uid))
+
+@dp.message(F.text.in_(["👨‍👩‍👧 Семья", "👨‍👩‍👧 Family", "👨‍👩‍👧 Сім'я", "👨‍👩‍👧 Famiglia", "👨‍👩‍👧 Familia", "👨‍👩‍👧 Familie"]))
+async def family_menu(m: Message):
+    ensure_user(m.from_user.id, m.from_user.language_code)
+    uid = m.from_user.id
+    ps = db.execute("SELECT * FROM patients WHERE owner=? AND user_uid IS NULL", (uid,)).fetchall()
+    if not ps:
+        await m.answer(t(uid, "family_none"), reply_markup=main_menu(uid))
+        return
+    lines = [t(uid, "family_codes")]
+    for p in ps:
+        lines.append(f"👤 {p['name']}: {p['code']}")
+    lines.append("\n" + t(uid, "family_hint"))
+    await m.answer("\n".join(lines), reply_markup=main_menu(uid))
+
+@dp.message(F.text.in_(["🌐 Язык", "🌐 Language", "🌐 Мова", "🌐 Lingua", "🌐 Idioma", "🌐 Sprache"]))
+async def lang_menu(m: Message):
+    ensure_user(m.from_user.id, m.from_user.language_code)
+    uid = m.from_user.id
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=name, callback_data=f"lang:{code}")]
+        for code, name in LANG_NAMES.items()])
+    await m.answer(t(uid, "lang_choose"), reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def cb_lang(cb: CallbackQuery):
+    ensure_user(cb.from_user.id, cb.from_user.language_code)
+    code = cb.data.split(":")[1]
+    if code in TEXTS:
+        db.execute("UPDATE users SET lang=? WHERE uid=?", (code, cb.from_user.id))
+        db.commit()
+    await cb.answer("OK")
+    await cb.message.edit_text(t(cb.from_user.id, "lang_set"))
+    await cb.message.answer(t(cb.from_user.id, "menu_text"), reply_markup=main_menu(cb.from_user.id))
+
+# Пошаговое добавление лекарства
+@dp.message(F.text)
+async def step_handler(m: Message):
+    ensure_user(m.from_user.id, m.from_user.language_code)
+    uid = m.from_user.id
+    row = db.execute("SELECT step FROM users WHERE uid=?", (uid,)).fetchone()
+    if not row or row["step"] != "med_name":
+        return
+    
+    name = m.text.strip()
+    if not name or len(name) > 50:
+        await m.answer(t(uid, "med_bad_name"))
+        return
+    
+    db.execute("UPDATE users SET step='med_time' WHERE uid=?", (uid,))
+    db.execute("INSERT INTO patients(owner, name, code) VALUES(?,?,?)",
+               (uid, name, gen_code()))
+    db.commit()
+    await m.answer(t(uid, "med_ask_time"), reply_markup=ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🏠 Меню")]], resize_keyboard=True))
+
+@dp.message(F.text)
+async def time_handler(m: Message):
+    ensure_user(m.from_user.id, m.from_user.language_code)
+    uid = m.from_user.id
+    row = db.execute("SELECT step FROM users WHERE uid=?", (uid,)).fetchone()
+    if not row or row["step"] != "med_time":
+        return
+    
+    times_text = m.text.strip()
+    times = []
+    for part in times_text.split(","):
+        part = part.strip()
+        if not re.fullmatch(r"\d{1,2}:\d{2}", part):
+            await m.answer(t(uid, "med_bad_time"))
+            return
+        h, mi = map(int, part.split(":"))
+        if h > 23 or mi > 59:
+            await m.answer(t(uid, "med_bad_time"))
+            return
+        times.append(f"{h:02d}:{mi:02d}")
+    
+    times = sorted(set(times))[:6]
+    if not times:
+        await m.answer(t(uid, "med_bad_time"))
+        return
+    
+    db.execute("UPDATE users SET step='menu' WHERE uid=?", (uid,))
+    db.commit()
+    await m.answer(t(uid, "med_done", times=", ".join(times)), reply_markup=main_menu(uid))
 
 @dp.callback_query(F.data.startswith(("take:", "takefor:")))
 async def cb_take(cb: CallbackQuery, bot: Bot):
@@ -329,34 +304,7 @@ async def cb_snooze(cb: CallbackQuery):
     db.commit()
     await cb.answer(t(uid, "snoozed"))
 
-@dp.callback_query(F.data.startswith("delmed:"))
-async def cb_delmed(cb: CallbackQuery):
-    ensure_user(cb.from_user.id, cb.from_user.language_code)
-    uid = cb.from_user.id
-    med = db.execute("SELECT * FROM meds WHERE id=?",
-                     (int(cb.data.split(":")[1]),)).fetchone()
-    if med is None:
-        await cb.answer(t(uid, "not_found"))
-        return
-    p = db.execute("SELECT * FROM patients WHERE id=?", (med["patient_id"],)).fetchone()
-    if p["owner"] != uid:
-        await cb.answer(t(uid, "not_found"))
-        return
-    db.execute("DELETE FROM doses WHERE med_id=?", (med["id"],))
-    db.execute("DELETE FROM meds WHERE id=?", (med["id"],))
-    db.commit()
-    await cb.answer(t(uid, "med_deleted"))
-    try:
-        await cb.message.edit_text(t(uid, "med_deleted") + "\n/list")
-    except Exception:
-        pass
-
-@dp.message(F.text)
-async def on_text(m: Message):
-    ensure_user(m.from_user.id, m.from_user.language_code)
-    await m.answer(t(m.from_user.id, "unknown"))
-
-# ---------- Ядро: планировщик (не зависит от платформы) ----------
+# Планировщик (тот же, что в v2)
 async def tick(bot: Bot):
     now = now_utc()
     for p in db.execute("SELECT * FROM patients").fetchall():
@@ -437,7 +385,7 @@ async def scheduler(bot: Bot):
 
 async def main():
     if "ВСТАВЬТЕ" in TOKEN:
-        raise SystemExit("❌ Укажите токен в строке TOKEN или в переменной BOT_TOKEN")
+        raise SystemExit("❌ Укажите токен")
     bot = Bot(token=TOKEN)
     asyncio.create_task(scheduler(bot))
     print("✅ Care bot started")
